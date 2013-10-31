@@ -1,0 +1,5 @@
+Russell   male     CN    26
+Johnson   male     UK    32
+Lucy      female   USA   10
+Donald    male     UK    50
+Tracey    female   CN    20

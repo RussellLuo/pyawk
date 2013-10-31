@@ -1,0 +1,377 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+"""A simple variant of AWK in Python.
+
+Usage:
+    pyawk [option] cmd file
+    cat file | pyawk [option] cmd
+
+option:
+    -F fs
+    -f progfile
+    -v (verbose)
+
+cmd:
+    'BEGIN { action }
+     pattern { action }
+     END { action }'
+
+pattern:
+    regular expression -- [$n][!]/regex/
+    expression         -- valid Python expression
+    begpat, endpat     -- begin pattern, end pattern
+    empty              -- match every input record
+
+action:
+    valid Python statements (don't support variables used before defined)
+
+Examples:
+    pyawk 'END { print(NR) }' /etc/passwd
+    echo -e 'python .py\\nperl .pl\\nshell .sh' | pyawk '$2!/pl/{ print($1) }'
+    ps aux | pyawk 'BEGIN { print("USER|PID|COMMAND") }; $2 == 10, $2 == 50 { print($1, $2, $11) }'
+"""
+
+from __future__ import print_function
+
+import sys
+import re
+import logging
+
+##### Built-in variables
+
+# Number of Records
+NR = 0
+
+# Number of Fields
+NF = 0
+
+# input Field Separator
+FS = None # `None` represents whitespace in `str.split()`
+
+# input Record Separator
+RS = u'\n'
+
+# Output Field Separator
+OFS = u' '
+
+# Output Record Separator
+ORS = u'\n'
+
+##### Status variable specially for "begpat, endpat" mode
+SWITCH_ON = False
+
+def run(fieldsep, progfile, verbose, command, filename):
+    """Main entry of `pyawk`.
+    """
+    try:
+        do_config(fieldsep, verbose)
+
+        content = get_content(filename)
+        for cmd in get_cmds(progfile, command):
+            process_content(cmd, content)
+
+    except Exception, e:
+        logging.error(unicode(e))
+
+def do_config(fieldsep, verbose):
+    """Do global configurations.
+    """
+    # "-F" format:
+    #     -F:
+    #     -F[:,;]
+    global FS
+    m = re.match(r'(\[(.+)\])|(.)$', fieldsep)
+    if m:
+        # set `FS` (field separator) if specified
+        FS = m.group(2) or m.group(3)
+
+    # use level `logging.INFO` if "-v" flag is set
+    lvl = logging.INFO if verbose else logging.ERROR
+    #lvl = logging.DEBUG
+    logging.basicConfig(format='%(message)s', level=lvl)
+
+def get_cmds(progfile, command):
+    """Get commands from `progfile` or from `command`.
+    """
+    if not progfile: # `cmd` from argument
+        return [command]
+    else: # `cmd` from file (actually a Python module)
+        from importlib import import_module
+        mod_name = progfile
+
+        try:
+            import_module(mod_name)
+            return getattr(sys.modules[mod_name], 'cmds', [])
+        except ImportError:
+            raise ImportError(u"no file named '%s.py'" % mod_name.replace(u'.', u'/'))
+
+def get_content(filename=u''):
+    """Get contents from file or from standard input.
+    """
+    if filename:
+        inp = open(filename)
+    else:
+        inp = sys.stdin
+
+    try:
+        return unicode(inp.read(), encoding='utf-8')
+    except KeyboardInterrupt:
+        return u''
+
+def process_content(cmd, content=u''):
+    """Core process of `pyawk`.
+    """
+    global NR, NF
+    content = content.strip()
+
+    begin, normal, end = parse_cmd(cmd)
+    logging.debug('BEGIN: %s, NORMAL: %s, END: %s' % (begin, normal, end))
+
+    do_begin(begin)
+
+    NR = 0
+    for record in content.split(RS):
+        NR += 1
+
+        ##### Fields of current record
+        # $i <=> fields[i]
+        # $0: the whole record
+        # $1-$n: the actual field
+        fields = [record] + list(multi_split(record, FS))
+        logging.debug(u'fields: %s' % unicode(fields))
+
+        NF = len(fields) - 1
+
+        do_normal(normal, fields)
+
+    do_end(end)
+
+def parse_cmd(cmd):
+    """Parse `cmd` to get meaningful parts (i.e. `begin`, `normal`, and `end`).
+
+    `cmd` format:
+        BEGIN { action }
+        pattern { action }
+        END { action }
+    """
+    begin_pat = re.compile(r'BEGIN\s*\{(.+?)\}\s*;?', re.X | re.S)
+    end_pat = re.compile(r'END\s*\{(.+?)\}\s*;?', re.X | re.S)
+    normal_pat = re.compile(r'([^{]*)(\{(.+?)\})?\s*;?', re.X | re.S)
+
+    # get BEGIN part
+    begin = u''
+    m = begin_pat.search(cmd)
+    if m:
+        begin = m.group(1).strip()
+        cmd = cmd.replace(m.group(0), u'')
+
+    # get END part
+    end = u''
+    m = end_pat.search(cmd)
+    if m:
+        end = m.group(1).strip()
+        cmd = cmd.replace(m.group(0), u'')
+
+    # get NORMAL part
+    normal = (u'', u'')
+    m = normal_pat.search(cmd)
+    if m:
+        pattern = m.group(1) or u'' # get u'' if \1 is None
+        action = m.group(3) or u'' # get u'' if \3 is None
+        normal = (pattern.strip(), action.strip())
+
+    return (begin, normal, end)
+
+def do_begin(begin):
+    """Do actions in `begin`
+    """
+    if begin:
+        do_action(begin)
+
+def do_normal(normal, fields):
+    """Do actions in `normal`
+    """
+    pattern, action = normal
+    if not (pattern or action):
+        return
+
+    if not action: # no `action` specified, print the whole record by default
+        action = u'print($0)'
+
+    # `pattern` matches
+    if test_pattern(pattern, fields):
+        statements = translate_fields(action, fields, repr(u'')) # replace non-exist `$i` with u''
+        do_action(statements)
+
+def do_end(end):
+    """Do actions in `end`
+    """
+    if end:
+        do_action(end)
+
+def multi_split(text, seps):
+    """Split `text` by one or more separators specified in `seps`.
+    """
+    if not seps: # split by whitespaces
+        return text.split()
+    else: # split by separators in `seps`
+
+        ##### Topics on Stack Overflow
+        # http://stackoverflow.com/questions/1059559/python-strings-split-with-multiple-separators
+
+        ## Method 1: use `re.split()` (from gimel)
+        return re.split(r'[%s]' % seps, text)
+
+        ## Method 2: DIY (from pprzemek)
+        '''
+        res = [text]
+        for sep in seps:
+            text, res = res, []
+            for s in text:
+                res += s.split(sep)
+        return res
+        '''
+
+def test_pattern(pattern, fields):
+    """Test `pattern` after all "Built-in variables" are translated.
+
+    `pattern` format:
+        regular expression -- [$n][!]/regex/
+        expression         -- valid Python expression
+        begpat, endpat     -- begin pattern, end pattern
+        empty              -- match every input record
+
+    Algorithms reference: http://www.gnu.org/software/gawk/manual/gawk.html#Pattern-Overview
+
+    Main differences between `pyawk` and `awk` here:
+
+        1. "regular expression"
+
+        `pyawk`               | `awk`
+        --------------------- | ------------------------
+        /regex/ <=> $0/regex/ | /regex/ <=> $0 ~ /regex/
+        $1/regex/             | $1 ~ /regex/
+        $1!/regex/            | $1 !~ /regex/
+
+        2. "expression"
+
+        `pyawk`                           | `awk`
+        --------------------------------- | ------------------------------
+        all valid expressions in `Python` | all valid expressions in `awk`
+    """
+    if not pattern: # "empty" pattern
+        return True
+
+    def eval_exp(text):
+        m = re.match(r'^(\$(\d+))?(!)?/([^/]*)/$', text)
+        try:
+            if m: # regular expression
+                _, num, neg, pat = m.groups()
+                num = int(num) if num else 0 # if no `$i` specified, default to `$0`
+                m = re.search(pat, fields[num])
+                logging.info(u"regex: '%s' %s~ /%s/" % (fields[num], neg or u'', pat))
+                return bool(m) != bool(neg)
+            else: # expression
+                exp = translate_fields(text, fields, u'_') # replace non-exist `$i` with u'_'
+                logging.info(u'exp: %s' % exp)
+                return bool(exp and eval(exp))
+        except Exception, e:
+            logging.debug(unicode(e))
+            return False
+
+    if u',' not in pattern: # "regular expression" or "expression" pattern
+        return eval_exp(pattern)
+    else: # "begpat, endpat" pattern
+        global SWITCH_ON
+
+        value = False
+
+        begpat, endpat = [s.strip() for s in pattern.split(u',')]
+        if eval_exp(begpat):
+            SWITCH_ON = True
+        if SWITCH_ON:
+            value = True
+        if eval_exp(endpat):
+            SWITCH_ON = False
+
+        return value
+
+def do_action(action):
+    """Do `action` after all "Builtin variables" are translated.
+
+    `action` is just valid Python statements.
+
+    Main differences between `pyawk` and `awk` here:
+
+        `pyawk`                           | `awk`
+        --------------------------------- | ---------------------------------
+        all valid statements in `Python`  | all valid statements in `awk`
+        print($1, $2, $3)                 | print $1, $2, $3
+        `print` (×, must be `print($0)`)  | `print` (√, <=> `print $0`)
+        variables used before defined (×) | variables used before defined (√)
+    """
+    logging.info(u'action: %s' % action)
+    action = action.replace(u'print', u'custom_print')
+
+    exec(action, globals())
+
+def translate_fields(text, fields, nonexist):
+    """Translate `$i` in `text` to the value of `fields[i]` if necessary.
+    """
+    def repl(m):
+        i = int(m.group(1))
+        try:
+            value = fields[i]
+        except IndexError: # `i` out of range
+            return nonexist
+        else:
+            try:
+                int(value) # `fields[i]` is an integer
+                return value
+            except ValueError: # `fields[i]` is a string
+                return repr(value)
+
+    return re.sub(r'\$(\d+)', repl, text)
+
+def custom_print(*objects):
+    """Customize built-in `print` with specific `sep` and `end`.
+    """
+    print(*objects, sep=OFS, end=ORS)
+
+def get_args():
+    import getopt
+
+    try:
+        optlist, args = getopt.getopt(sys.argv[1:], 'F:f:v')
+
+        optdict = dict(optlist)
+        opt_F = optdict.get('-F', '')
+        opt_f = optdict.get('-f', '')
+        opt_v = '-v' in optdict
+
+        if opt_f: # `pyawk -f progfile [file]`
+            if len(args) > 1:
+                raise getopt.GetoptError('arguments number error')
+            else:
+                arg_cmd = ''
+                arg_file = args[0] if len(args) == 1 else ''
+        else: # `pyawk cmd [file]`
+            if len(args) not in (1, 2):
+                raise getopt.GetoptError('arguments number error')
+            else:
+                arg_cmd = args[0]
+                arg_file = args[1] if len(args) == 2 else ''
+
+        return (unicode(opt_F), unicode(opt_f), opt_v, unicode(arg_cmd), unicode(arg_file))
+    except getopt.GetoptError:
+        return ()
+
+# test
+if __name__ == '__main__':
+    params = get_args()
+    if not params:
+        sys.stderr.write(__doc__)
+        sys.exit(1)
+    else:
+        run(*params)
